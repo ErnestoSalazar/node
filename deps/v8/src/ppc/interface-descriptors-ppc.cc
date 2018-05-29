@@ -32,7 +32,7 @@ void RecordWriteDescriptor::InitializePlatformSpecific(
   data->InitializePlatformSpecific(kParameterCount, default_stub_registers);
 }
 
-const Register FastNewFunctionContextDescriptor::FunctionRegister() {
+const Register FastNewFunctionContextDescriptor::ScopeInfoRegister() {
   return r4;
 }
 const Register FastNewFunctionContextDescriptor::SlotsRegister() { return r3; }
@@ -188,12 +188,6 @@ void ConstructTrampolineDescriptor::InitializePlatformSpecific(
 }
 
 
-void TransitionElementsKindDescriptor::InitializePlatformSpecific(
-    CallInterfaceDescriptorData* data) {
-  Register registers[] = {r3, r4};
-  data->InitializePlatformSpecific(arraysize(registers), registers);
-}
-
 void AbortJSDescriptor::InitializePlatformSpecific(
     CallInterfaceDescriptorData* data) {
   Register registers[] = {r4};
@@ -248,12 +242,6 @@ void CompareDescriptor::InitializePlatformSpecific(
 
 
 void BinaryOpDescriptor::InitializePlatformSpecific(
-    CallInterfaceDescriptorData* data) {
-  Register registers[] = {r4, r3};
-  data->InitializePlatformSpecific(arraysize(registers), registers);
-}
-
-void StringAddDescriptor::InitializePlatformSpecific(
     CallInterfaceDescriptorData* data) {
   Register registers[] = {r4, r3};
   data->InitializePlatformSpecific(arraysize(registers), registers);

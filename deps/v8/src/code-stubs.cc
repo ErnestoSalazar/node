@@ -14,13 +14,13 @@
 #include "src/code-stub-assembler.h"
 #include "src/code-stubs-utils.h"
 #include "src/counters.h"
-#include "src/factory.h"
 #include "src/gdb-jit.h"
 #include "src/heap/heap-inl.h"
 #include "src/ic/ic-stats.h"
 #include "src/ic/ic.h"
 #include "src/macro-assembler.h"
 #include "src/objects-inl.h"
+#include "src/objects/hash-table-inl.h"
 #include "src/tracing/tracing-category-observer.h"
 
 namespace v8 {
@@ -34,7 +34,7 @@ CodeStubDescriptor::CodeStubDescriptor(CodeStub* stub)
       stack_parameter_count_(no_reg),
       hint_stack_parameter_count_(-1),
       function_mode_(NOT_JS_FUNCTION_STUB_MODE),
-      deoptimization_handler_(nullptr),
+      deoptimization_handler_(kNullAddress),
       miss_handler_(),
       has_miss_handler_(false) {
   stub->InitializeDescriptor(this);
@@ -45,7 +45,7 @@ CodeStubDescriptor::CodeStubDescriptor(Isolate* isolate, uint32_t stub_key)
       stack_parameter_count_(no_reg),
       hint_stack_parameter_count_(-1),
       function_mode_(NOT_JS_FUNCTION_STUB_MODE),
-      deoptimization_handler_(nullptr),
+      deoptimization_handler_(kNullAddress),
       miss_handler_(),
       has_miss_handler_(false) {
   CodeStub::InitializeDescriptor(isolate, stub_key, this);
@@ -88,7 +88,7 @@ void CodeStub::RecordCodeGeneration(Handle<Code> code) {
           CodeCreateEvent(CodeEventListener::STUB_TAG,
                           AbstractCode::cast(*code), os.str().c_str()));
   Counters* counters = isolate()->counters();
-  counters->total_stubs_code_size()->Increment(code->instruction_size());
+  counters->total_stubs_code_size()->Increment(code->raw_instruction_size());
 #ifdef DEBUG
   code->VerifyEmbeddedObjects();
 #endif
@@ -257,50 +257,13 @@ MaybeHandle<Code> CodeStub::GetCode(Isolate* isolate, uint32_t key) {
   return scope.CloseAndEscape(code);
 }
 
-
-void StringAddStub::PrintBaseName(std::ostream& os) const {  // NOLINT
-  os << "StringAddStub_" << flags() << "_" << pretenure_flag();
-}
-
-TF_STUB(StringAddStub, CodeStubAssembler) {
-  StringAddFlags flags = stub->flags();
-  PretenureFlag pretenure_flag = stub->pretenure_flag();
-
-  Node* left = Parameter(Descriptor::kLeft);
-  Node* right = Parameter(Descriptor::kRight);
-  Node* context = Parameter(Descriptor::kContext);
-
-  if ((flags & STRING_ADD_CHECK_LEFT) != 0) {
-    DCHECK_NE(flags & STRING_ADD_CONVERT, 0);
-    // TODO(danno): The ToString and JSReceiverToPrimitive below could be
-    // combined to avoid duplicate smi and instance type checks.
-    left = ToString(context, JSReceiverToPrimitive(context, left));
-  }
-  if ((flags & STRING_ADD_CHECK_RIGHT) != 0) {
-    DCHECK_NE(flags & STRING_ADD_CONVERT, 0);
-    // TODO(danno): The ToString and JSReceiverToPrimitive below could be
-    // combined to avoid duplicate smi and instance type checks.
-    right = ToString(context, JSReceiverToPrimitive(context, right));
-  }
-
-  if ((flags & STRING_ADD_CHECK_BOTH) == 0) {
-    CodeStubAssembler::AllocationFlag allocation_flags =
-        (pretenure_flag == TENURED) ? CodeStubAssembler::kPretenured
-                                    : CodeStubAssembler::kNone;
-    Return(StringAdd(context, CAST(left), CAST(right), allocation_flags));
-  } else {
-    Callable callable = CodeFactory::StringAdd(isolate(), STRING_ADD_CHECK_NONE,
-                                               pretenure_flag);
-    TailCallStub(callable, context, left, right);
-  }
-}
-
 Handle<Code> TurboFanCodeStub::GenerateCode() {
   const char* name = CodeStub::MajorName(MajorKey());
   Zone zone(isolate()->allocator(), ZONE_NAME);
   CallInterfaceDescriptor descriptor(GetCallInterfaceDescriptor());
-  compiler::CodeAssemblerState state(isolate(), &zone, descriptor, Code::STUB,
-                                     name, 1, GetKey());
+  compiler::CodeAssemblerState state(
+      isolate(), &zone, descriptor, Code::STUB, name,
+      PoisoningMitigationLevel::kDontPoison, 1, GetKey());
   GenerateAssembly(&state);
   return compiler::CodeAssembler::GenerateCode(&state);
 }
@@ -339,23 +302,6 @@ TF_STUB(ElementsTransitionAndStoreStub, CodeStubAssembler) {
     Comment("Miss");
     TailCallRuntime(Runtime::kElementsTransitionAndStoreIC_Miss, context,
                     receiver, key, value, map, slot, vector);
-  }
-}
-
-TF_STUB(TransitionElementsKindStub, CodeStubAssembler) {
-  Node* context = Parameter(Descriptor::kContext);
-  Node* object = Parameter(Descriptor::kObject);
-  Node* new_map = Parameter(Descriptor::kMap);
-
-  Label bailout(this);
-  TransitionElementsKind(object, new_map, stub->from_kind(), stub->to_kind(),
-                         stub->is_jsarray(), &bailout);
-  Return(object);
-
-  BIND(&bailout);
-  {
-    Comment("Call runtime");
-    TailCallRuntime(Runtime::kTransitionElementsKind, context, object, new_map);
   }
 }
 
@@ -438,61 +384,6 @@ int JSEntryStub::GenerateHandlerTable(MacroAssembler* masm) {
   return handler_table_offset;
 }
 
-
-// TODO(ishell): move to builtins.
-TF_STUB(GetPropertyStub, CodeStubAssembler) {
-  Label call_runtime(this, Label::kDeferred), return_undefined(this), end(this);
-
-  Node* object = Parameter(Descriptor::kObject);
-  Node* key = Parameter(Descriptor::kKey);
-  Node* context = Parameter(Descriptor::kContext);
-  VARIABLE(var_result, MachineRepresentation::kTagged);
-
-  CodeStubAssembler::LookupInHolder lookup_property_in_holder =
-      [=, &var_result, &end](Node* receiver, Node* holder, Node* holder_map,
-                             Node* holder_instance_type, Node* unique_name,
-                             Label* next_holder, Label* if_bailout) {
-        VARIABLE(var_value, MachineRepresentation::kTagged);
-        Label if_found(this);
-        TryGetOwnProperty(context, receiver, holder, holder_map,
-                          holder_instance_type, unique_name, &if_found,
-                          &var_value, next_holder, if_bailout);
-        BIND(&if_found);
-        {
-          var_result.Bind(var_value.value());
-          Goto(&end);
-        }
-      };
-
-  CodeStubAssembler::LookupInHolder lookup_element_in_holder =
-      [=](Node* receiver, Node* holder, Node* holder_map,
-          Node* holder_instance_type, Node* index, Label* next_holder,
-          Label* if_bailout) {
-        // Not supported yet.
-        Use(next_holder);
-        Goto(if_bailout);
-      };
-
-  TryPrototypeChainLookup(object, key, lookup_property_in_holder,
-                          lookup_element_in_holder, &return_undefined,
-                          &call_runtime);
-
-  BIND(&return_undefined);
-  {
-    var_result.Bind(UndefinedConstant());
-    Goto(&end);
-  }
-
-  BIND(&call_runtime);
-  {
-    var_result.Bind(CallRuntime(Runtime::kGetProperty, context, object, key));
-    Goto(&end);
-  }
-
-  BIND(&end);
-  Return(var_result.value());
-}
-
 // TODO(ishell): move to builtins-handler-gen.
 TF_STUB(StoreSlowElementStub, CodeStubAssembler) {
   Node* receiver = Parameter(Descriptor::kReceiver);
@@ -504,6 +395,15 @@ TF_STUB(StoreSlowElementStub, CodeStubAssembler) {
 
   TailCallRuntime(Runtime::kKeyedStoreIC_Slow, context, value, slot, vector,
                   receiver, name);
+}
+
+TF_STUB(StoreInArrayLiteralSlowStub, CodeStubAssembler) {
+  Node* array = Parameter(Descriptor::kReceiver);
+  Node* index = Parameter(Descriptor::kName);
+  Node* value = Parameter(Descriptor::kValue);
+  Node* context = Parameter(Descriptor::kContext);
+  TailCallRuntime(Runtime::kStoreInArrayLiteralIC_Slow, context, value, array,
+                  index);
 }
 
 TF_STUB(StoreFastElementStub, CodeStubAssembler) {
@@ -556,6 +456,46 @@ void ProfileEntryHookStub::EntryHookTrampoline(intptr_t function,
   FunctionEntryHook entry_hook = isolate->function_entry_hook();
   DCHECK_NOT_NULL(entry_hook);
   entry_hook(function, stack_pointer);
+}
+
+void CodeStub::GenerateStubsAheadOfTime(Isolate* isolate) {
+  CommonArrayConstructorStub::GenerateStubsAheadOfTime(isolate);
+  StoreFastElementStub::GenerateAheadOfTime(isolate);
+}
+
+namespace {
+
+template <class T>
+void ArrayConstructorStubAheadOfTimeHelper(Isolate* isolate) {
+  int to_index =
+      GetSequenceIndexFromFastElementsKind(TERMINAL_FAST_ELEMENTS_KIND);
+  for (int i = 0; i <= to_index; ++i) {
+    ElementsKind kind = GetFastElementsKindFromSequenceIndex(i);
+    T stub(isolate, kind);
+    stub.GetCode();
+    if (AllocationSite::ShouldTrack(kind)) {
+      T stub1(isolate, kind, DISABLE_ALLOCATION_SITES);
+      stub1.GetCode();
+    }
+  }
+}
+
+}  // namespace
+
+void CommonArrayConstructorStub::GenerateStubsAheadOfTime(Isolate* isolate) {
+  ArrayConstructorStubAheadOfTimeHelper<ArrayNoArgumentConstructorStub>(
+      isolate);
+  ArrayConstructorStubAheadOfTimeHelper<ArraySingleArgumentConstructorStub>(
+      isolate);
+
+  ElementsKind kinds[2] = {PACKED_ELEMENTS, HOLEY_ELEMENTS};
+  for (int i = 0; i < 2; i++) {
+    // For internal arrays we only need a few things
+    InternalArrayNoArgumentConstructorStub stubh1(isolate, kinds[i]);
+    stubh1.GetCode();
+    InternalArraySingleArgumentConstructorStub stubh2(isolate, kinds[i]);
+    stubh2.GetCode();
+  }
 }
 
 TF_STUB(ArrayNoArgumentConstructorStub, CodeStubAssembler) {
@@ -611,7 +551,7 @@ void ArrayConstructorAssembler::GenerateConstructor(
 
   if (IsFastPackedElementsKind(elements_kind)) {
     Label abort(this, Label::kDeferred);
-    Branch(SmiEqual(array_size, SmiConstant(0)), &small_smi_size, &abort);
+    Branch(SmiEqual(CAST(array_size), SmiConstant(0)), &small_smi_size, &abort);
 
     BIND(&abort);
     Node* reason = SmiConstant(AbortReason::kAllocatingNonEmptyPackedArray);
@@ -623,7 +563,7 @@ void ArrayConstructorAssembler::GenerateConstructor(
         (kMaxRegularHeapObjectSize - FixedArray::kHeaderSize - JSArray::kSize -
          AllocationMemento::kSize) /
         element_size;
-    Branch(SmiAboveOrEqual(array_size, SmiConstant(max_fast_elements)),
+    Branch(SmiAboveOrEqual(CAST(array_size), SmiConstant(max_fast_elements)),
            &call_runtime, &small_smi_size);
   }
 
@@ -674,12 +614,6 @@ TF_STUB(InternalArraySingleArgumentConstructorStub, ArrayConstructorAssembler) {
   GenerateConstructor(context, function, array_map, array_size, allocation_site,
                       stub->elements_kind(), DONT_TRACK_ALLOCATION_SITE);
 }
-
-ArrayConstructorStub::ArrayConstructorStub(Isolate* isolate)
-    : PlatformCodeStub(isolate) {}
-
-InternalArrayConstructorStub::InternalArrayConstructorStub(Isolate* isolate)
-    : PlatformCodeStub(isolate) {}
 
 CommonArrayConstructorStub::CommonArrayConstructorStub(
     Isolate* isolate, ElementsKind kind,

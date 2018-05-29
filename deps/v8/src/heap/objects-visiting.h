@@ -9,7 +9,7 @@
 #include "src/layout-descriptor.h"
 #include "src/objects-body-descriptors.h"
 #include "src/objects.h"
-#include "src/objects/hash-table.h"
+#include "src/objects/ordered-hash-table.h"
 #include "src/objects/string.h"
 #include "src/visitors.h"
 
@@ -18,6 +18,7 @@ namespace internal {
 
 class BigInt;
 class BytecodeArray;
+class DataHandler;
 class JSArrayBuffer;
 class JSRegExp;
 class JSWeakCollection;
@@ -31,6 +32,7 @@ class JSWeakCollection;
   V(Code)                        \
   V(CodeDataContainer)           \
   V(ConsString)                  \
+  V(DataHandler)                 \
   V(FeedbackCell)                \
   V(FeedbackVector)              \
   V(FixedArray)                  \
@@ -40,7 +42,6 @@ class JSWeakCollection;
   V(JSArrayBuffer)               \
   V(JSFunction)                  \
   V(JSObject)                    \
-  V(JSRegExp)                    \
   V(JSWeakCollection)            \
   V(Map)                         \
   V(Oddball)                     \
@@ -55,6 +56,7 @@ class JSWeakCollection;
   V(Symbol)                      \
   V(ThinString)                  \
   V(TransitionArray)             \
+  V(WasmInstanceObject)          \
   V(WeakCell)
 
 // The base class for visitors that need to dispatch on object type. The default
@@ -83,6 +85,9 @@ class HeapVisitor : public ObjectVisitor {
   V8_INLINE bool ShouldVisitMapPointer() { return true; }
   // A callback for visiting the map pointer in the object header.
   V8_INLINE void VisitMapPointer(HeapObject* host, HeapObject** map);
+  // If this predicate returns false, then the heap visitor will fail
+  // in default Visit implemention for subclasses of JSObject.
+  V8_INLINE bool AllowDefaultJSObjectVisit() { return true; }
 
 #define VISIT(type) V8_INLINE ResultType Visit##type(Map* map, type* object);
   TYPED_VISITOR_ID_LIST(VISIT)
@@ -94,6 +99,7 @@ class HeapVisitor : public ObjectVisitor {
   V8_INLINE ResultType VisitJSApiObject(Map* map, JSObject* object);
   V8_INLINE ResultType VisitStruct(Map* map, HeapObject* object);
   V8_INLINE ResultType VisitFreeSpace(Map* map, FreeSpace* object);
+  V8_INLINE ResultType VisitWeakArray(Map* map, HeapObject* object);
 
   template <typename T>
   static V8_INLINE T* Cast(HeapObject* object);

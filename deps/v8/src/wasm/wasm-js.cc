@@ -9,11 +9,12 @@
 #include "src/assert-scope.h"
 #include "src/ast/ast.h"
 #include "src/execution.h"
-#include "src/factory.h"
 #include "src/handles.h"
+#include "src/heap/factory.h"
 #include "src/isolate.h"
 #include "src/objects-inl.h"
-#include "src/objects.h"
+#include "src/objects/js-promise-inl.h"
+#include "src/objects/templates.h"
 #include "src/parsing/parse-info.h"
 #include "src/trap-handler/trap-handler.h"
 #include "src/wasm/wasm-engine.h"
@@ -163,6 +164,176 @@ void WebAssemblyCompileStreaming(
   i_isolate->wasm_compile_streaming_callback()(args);
 }
 
+namespace {
+// This class resolves the result of WebAssembly.compile. It just places the
+// compilation result in the supplied {promise}.
+class AsyncCompilationResolver : public i::wasm::CompilationResultResolver {
+ public:
+  AsyncCompilationResolver(i::Isolate* isolate, i::Handle<i::JSPromise> promise)
+      : promise_(isolate->global_handles()->Create(*promise)) {}
+
+  ~AsyncCompilationResolver() {
+    i::GlobalHandles::Destroy(i::Handle<i::Object>::cast(promise_).location());
+  }
+
+  void OnCompilationSucceeded(i::Handle<i::WasmModuleObject> result) override {
+    i::MaybeHandle<i::Object> promise_result =
+        i::JSPromise::Resolve(promise_, result);
+    CHECK_EQ(promise_result.is_null(),
+             promise_->GetIsolate()->has_pending_exception());
+  }
+
+  void OnCompilationFailed(i::Handle<i::Object> error_reason) override {
+    i::MaybeHandle<i::Object> promise_result =
+        i::JSPromise::Reject(promise_, error_reason);
+    CHECK_EQ(promise_result.is_null(),
+             promise_->GetIsolate()->has_pending_exception());
+  }
+
+ private:
+  i::Handle<i::JSPromise> promise_;
+};
+
+// This class resolves the result of WebAssembly.instantiate(module, imports).
+// It just places the instantiation result in the supplied {promise}.
+class InstantiateModuleResultResolver
+    : public i::wasm::InstantiationResultResolver {
+ public:
+  InstantiateModuleResultResolver(i::Isolate* isolate,
+                                  i::Handle<i::JSPromise> promise)
+      : promise_(isolate->global_handles()->Create(*promise)) {}
+
+  ~InstantiateModuleResultResolver() {
+    i::GlobalHandles::Destroy(i::Handle<i::Object>::cast(promise_).location());
+  }
+
+  void OnInstantiationSucceeded(
+      i::Handle<i::WasmInstanceObject> instance) override {
+    i::MaybeHandle<i::Object> promise_result =
+        i::JSPromise::Resolve(promise_, instance);
+    CHECK_EQ(promise_result.is_null(),
+             promise_->GetIsolate()->has_pending_exception());
+  }
+
+  void OnInstantiationFailed(i::Handle<i::Object> error_reason) override {
+    i::MaybeHandle<i::Object> promise_result =
+        i::JSPromise::Reject(promise_, error_reason);
+    CHECK_EQ(promise_result.is_null(),
+             promise_->GetIsolate()->has_pending_exception());
+  }
+
+ private:
+  i::Handle<i::JSPromise> promise_;
+};
+
+// This class resolves the result of WebAssembly.instantiate(bytes, imports).
+// For that it creates a new {JSObject} which contains both the provided
+// {WasmModuleObject} and the resulting {WebAssemblyInstanceObject} itself.
+class InstantiateBytesResultResolver
+    : public i::wasm::InstantiationResultResolver {
+ public:
+  InstantiateBytesResultResolver(i::Isolate* isolate,
+                                 i::Handle<i::JSPromise> promise,
+                                 i::Handle<i::WasmModuleObject> module)
+      : isolate_(isolate),
+        promise_(isolate_->global_handles()->Create(*promise)),
+        module_(isolate_->global_handles()->Create(*module)) {}
+
+  ~InstantiateBytesResultResolver() {
+    i::GlobalHandles::Destroy(i::Handle<i::Object>::cast(promise_).location());
+    i::GlobalHandles::Destroy(i::Handle<i::Object>::cast(module_).location());
+  }
+
+  void OnInstantiationSucceeded(
+      i::Handle<i::WasmInstanceObject> instance) override {
+    // The result is a JSObject with 2 fields which contain the
+    // WasmInstanceObject and the WasmModuleObject.
+    i::Handle<i::JSObject> result =
+        isolate_->factory()->NewJSObject(isolate_->object_function());
+
+    const uint8_t* instance_str = reinterpret_cast<const uint8_t*>("instance");
+    i::Handle<i::String> instance_name =
+        isolate_->factory()
+            ->NewStringFromOneByte(i::Vector<const uint8_t>(
+                instance_str,
+                i::StrLength(reinterpret_cast<const char*>(instance_str))))
+            .ToHandleChecked();
+
+    const uint8_t* module_str = reinterpret_cast<const uint8_t*>("module");
+    i::Handle<i::String> module_name =
+        isolate_->factory()
+            ->NewStringFromOneByte(i::Vector<const uint8_t>(
+                module_str,
+                i::StrLength(reinterpret_cast<const char*>(module_str))))
+            .ToHandleChecked();
+
+    i::JSObject::AddProperty(result, instance_name, instance, i::NONE);
+    i::JSObject::AddProperty(result, module_name, module_, i::NONE);
+
+    i::MaybeHandle<i::Object> promise_result =
+        i::JSPromise::Resolve(promise_, result);
+    CHECK_EQ(promise_result.is_null(), isolate_->has_pending_exception());
+  }
+
+  void OnInstantiationFailed(i::Handle<i::Object> error_reason) override {
+    i::MaybeHandle<i::Object> promise_result =
+        i::JSPromise::Reject(promise_, error_reason);
+    CHECK_EQ(promise_result.is_null(), isolate_->has_pending_exception());
+  }
+
+ private:
+  i::Isolate* isolate_;
+  i::Handle<i::JSPromise> promise_;
+  i::Handle<i::WasmModuleObject> module_;
+};
+
+// This class is the {CompilationResultResolver} for
+// WebAssembly.instantiate(bytes, imports). When compilation finishes,
+// {AsyncInstantiate} is started on the compilation result.
+class AsyncInstantiateCompileResultResolver
+    : public i::wasm::CompilationResultResolver {
+ public:
+  AsyncInstantiateCompileResultResolver(
+      i::Isolate* isolate, i::Handle<i::JSPromise> promise,
+      i::MaybeHandle<i::JSReceiver> maybe_imports)
+      : isolate_(isolate),
+        promise_(isolate_->global_handles()->Create(*promise)),
+        maybe_imports_(maybe_imports.is_null()
+                           ? maybe_imports
+                           : isolate_->global_handles()->Create(
+                                 *maybe_imports.ToHandleChecked())) {}
+
+  ~AsyncInstantiateCompileResultResolver() {
+    i::GlobalHandles::Destroy(i::Handle<i::Object>::cast(promise_).location());
+    if (!maybe_imports_.is_null()) {
+      i::GlobalHandles::Destroy(
+          i::Handle<i::Object>::cast(maybe_imports_.ToHandleChecked())
+              .location());
+    }
+  }
+
+  void OnCompilationSucceeded(i::Handle<i::WasmModuleObject> result) override {
+    isolate_->wasm_engine()->AsyncInstantiate(
+        isolate_,
+        base::make_unique<InstantiateBytesResultResolver>(isolate_, promise_,
+                                                          result),
+        result, maybe_imports_);
+  }
+
+  void OnCompilationFailed(i::Handle<i::Object> error_reason) override {
+    i::MaybeHandle<i::Object> promise_result =
+        i::JSPromise::Reject(promise_, error_reason);
+    CHECK_EQ(promise_result.is_null(), isolate_->has_pending_exception());
+  }
+
+ private:
+  i::Isolate* isolate_;
+  i::Handle<i::JSPromise> promise_;
+  i::MaybeHandle<i::JSReceiver> maybe_imports_;
+};
+
+}  // namespace
+
 // WebAssembly.compile(bytes) -> Promise
 void WebAssemblyCompile(const v8::FunctionCallbackInfo<v8::Value>& args) {
   v8::Isolate* isolate = args.GetIsolate();
@@ -177,21 +348,23 @@ void WebAssemblyCompile(const v8::FunctionCallbackInfo<v8::Value>& args) {
   }
 
   Local<Context> context = isolate->GetCurrentContext();
-  ASSIGN(Promise::Resolver, resolver, Promise::Resolver::New(context));
+  ASSIGN(Promise::Resolver, promise_resolver, Promise::Resolver::New(context));
+  Local<Promise> promise = promise_resolver->GetPromise();
   v8::ReturnValue<v8::Value> return_value = args.GetReturnValue();
-  return_value.Set(resolver->GetPromise());
+  return_value.Set(promise);
+
+  std::unique_ptr<i::wasm::CompilationResultResolver> resolver(
+      new AsyncCompilationResolver(i_isolate, Utils::OpenHandle(*promise)));
 
   bool is_shared = false;
   auto bytes = GetFirstArgumentAsBytes(args, &thrower, &is_shared);
   if (thrower.error()) {
-    auto maybe = resolver->Reject(context, Utils::ToLocal(thrower.Reify()));
-    CHECK_IMPLIES(!maybe.FromMaybe(false),
-                  i_isolate->has_scheduled_exception());
+    resolver->OnCompilationFailed(thrower.Reify());
     return;
   }
-  i::Handle<i::JSPromise> promise = Utils::OpenHandle(*resolver->GetPromise());
   // Asynchronous compilation handles copying wire bytes if necessary.
-  i_isolate->wasm_engine()->AsyncCompile(i_isolate, promise, bytes, is_shared);
+  i_isolate->wasm_engine()->AsyncCompile(i_isolate, std::move(resolver), bytes,
+                                         is_shared);
 }
 
 // WebAssembly.validate(bytes) -> bool
@@ -463,53 +636,67 @@ void WebAssemblyInstantiate(const v8::FunctionCallbackInfo<v8::Value>& args) {
 
   Local<Context> context = isolate->GetCurrentContext();
 
-  ASSIGN(Promise::Resolver, resolver, Promise::Resolver::New(context));
-  Local<Promise> promise = resolver->GetPromise();
+  ASSIGN(Promise::Resolver, promise_resolver, Promise::Resolver::New(context));
+  Local<Promise> promise = promise_resolver->GetPromise();
   args.GetReturnValue().Set(promise);
 
+  std::unique_ptr<i::wasm::InstantiationResultResolver> resolver(
+      new InstantiateModuleResultResolver(i_isolate,
+                                          Utils::OpenHandle(*promise)));
+
   Local<Value> first_arg_value = args[0];
-  // If args.Length < 2, this will be undefined - see FunctionCallbackInfo.
-  Local<Value> ffi = args[1];
   i::Handle<i::Object> first_arg = Utils::OpenHandle(*first_arg_value);
   if (!first_arg->IsJSObject()) {
     thrower.TypeError(
         "Argument 0 must be a buffer source or a WebAssembly.Module object");
-    auto maybe = resolver->Reject(context, Utils::ToLocal(thrower.Reify()));
-    CHECK_IMPLIES(!maybe.FromMaybe(false),
-                  i_isolate->has_scheduled_exception());
+    resolver->OnInstantiationFailed(thrower.Reify());
+    return;
+  }
+
+  // If args.Length < 2, this will be undefined - see FunctionCallbackInfo.
+  Local<Value> ffi = args[1];
+  i::MaybeHandle<i::JSReceiver> maybe_imports =
+      GetValueAsImports(ffi, &thrower);
+
+  if (thrower.error()) {
+    resolver->OnInstantiationFailed(thrower.Reify());
     return;
   }
 
   if (first_arg->IsWasmModuleObject()) {
     i::Handle<i::WasmModuleObject> module_obj =
         i::Handle<i::WasmModuleObject>::cast(first_arg);
-    // If args.Length < 2, this will be undefined - see FunctionCallbackInfo.
-    i::MaybeHandle<i::JSReceiver> maybe_imports =
-        GetValueAsImports(ffi, &thrower);
 
-    if (thrower.error()) {
-      auto maybe = resolver->Reject(context, Utils::ToLocal(thrower.Reify()));
-      CHECK_IMPLIES(!maybe.FromMaybe(false),
-                    i_isolate->has_scheduled_exception());
-      return;
-    }
-
-    i_isolate->wasm_engine()->AsyncInstantiate(
-        i_isolate, Utils::OpenHandle(*promise), module_obj, maybe_imports);
+    i_isolate->wasm_engine()->AsyncInstantiate(i_isolate, std::move(resolver),
+                                               module_obj, maybe_imports);
     return;
   }
 
-  // We did not get a WasmModuleObject as input, we first have to compile the
-  // input.
-  ASSIGN(Function, async_compile, Function::New(context, WebAssemblyCompile));
-  ASSIGN(Value, async_compile_retval,
-         async_compile->Call(context, args.Holder(), 1, &first_arg_value));
-  promise = Local<Promise>::Cast(async_compile_retval);
-  DCHECK(!promise.IsEmpty());
-  ASSIGN(Function, instantiate_impl,
-         Function::New(context, WebAssemblyInstantiateCallback, ffi));
-  ASSIGN(Promise, result, promise->Then(context, instantiate_impl));
-  args.GetReturnValue().Set(result);
+  bool is_shared = false;
+  auto bytes = GetFirstArgumentAsBytes(args, &thrower, &is_shared);
+  if (thrower.error()) {
+    resolver->OnInstantiationFailed(thrower.Reify());
+    return;
+  }
+
+  // We start compilation now, we have no use for the
+  // {InstantiationResultResolver}.
+  resolver.reset();
+
+  std::unique_ptr<i::wasm::CompilationResultResolver> compilation_resolver(
+      new AsyncInstantiateCompileResultResolver(
+          i_isolate, Utils::OpenHandle(*promise), maybe_imports));
+
+  // The first parameter is a buffer source, we have to check if we are allowed
+  // to compile it.
+  if (!i::wasm::IsWasmCodegenAllowed(i_isolate, i_isolate->native_context())) {
+    thrower.CompileError("Wasm code generation disallowed by embedder");
+    compilation_resolver->OnCompilationFailed(thrower.Reify());
+  }
+
+  // Asynchronous compilation handles copying wire bytes if necessary.
+  i_isolate->wasm_engine()->AsyncCompile(
+      i_isolate, std::move(compilation_resolver), bytes, is_shared);
 }
 
 bool GetIntegerProperty(v8::Isolate* isolate, ErrorThrower* thrower,
@@ -651,14 +838,13 @@ void WebAssemblyMemory(const v8::FunctionCallbackInfo<v8::Value>& args) {
     }
   }
 
+  i::SharedFlag shared_flag =
+      is_shared_memory ? i::SharedFlag::kShared : i::SharedFlag::kNotShared;
+  i::Handle<i::JSArrayBuffer> buffer;
   size_t size = static_cast<size_t>(i::wasm::kWasmPageSize) *
                 static_cast<size_t>(initial);
-  const bool enable_guard_regions =
-      internal::trap_handler::IsTrapHandlerEnabled();
-  i::Handle<i::JSArrayBuffer> buffer = i::wasm::NewArrayBuffer(
-      i_isolate, size, enable_guard_regions,
-      is_shared_memory ? i::SharedFlag::kShared : i::SharedFlag::kNotShared);
-  if (buffer.is_null()) {
+  if (!i::wasm::NewArrayBuffer(i_isolate, size, shared_flag)
+           .ToHandle(&buffer)) {
     thrower.RangeError("could not allocate memory");
     return;
   }
@@ -675,6 +861,114 @@ void WebAssemblyMemory(const v8::FunctionCallbackInfo<v8::Value>& args) {
   args.GetReturnValue().Set(Utils::ToLocal(memory_obj));
 }
 
+void WebAssemblyGlobal(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+  HandleScope scope(isolate);
+  ScheduledErrorThrower thrower(i_isolate, "WebAssembly.Global()");
+  if (!args.IsConstructCall()) {
+    thrower.TypeError("WebAssembly.Global must be invoked with 'new'");
+    return;
+  }
+  if (!args[0]->IsObject()) {
+    thrower.TypeError("Argument 0 must be a global descriptor");
+    return;
+  }
+  Local<Context> context = isolate->GetCurrentContext();
+  Local<v8::Object> descriptor = Local<Object>::Cast(args[0]);
+
+  // The descriptor's 'mutable'.
+  bool is_mutable = false;
+  {
+    Local<String> mutable_key = v8_str(isolate, "mutable");
+    v8::MaybeLocal<v8::Value> maybe = descriptor->Get(context, mutable_key);
+    v8::Local<v8::Value> value;
+    if (maybe.ToLocal(&value)) {
+      if (!value->BooleanValue(context).To(&is_mutable)) return;
+    }
+  }
+
+  // The descriptor's 'type'.
+  i::wasm::ValueType type;
+  {
+    v8::MaybeLocal<v8::Value> maybe =
+        descriptor->Get(context, v8_str(isolate, "type"));
+    v8::Local<v8::Value> value;
+    if (!maybe.ToLocal(&value)) return;
+    v8::Local<v8::String> string;
+    if (!value->ToString(context).ToLocal(&string)) return;
+
+    bool equal;
+    if (string->Equals(context, v8_str(isolate, "i32")).To(&equal) && equal) {
+      type = i::wasm::kWasmI32;
+    } else if (string->Equals(context, v8_str(isolate, "f32")).To(&equal) &&
+               equal) {
+      type = i::wasm::kWasmF32;
+    } else if (string->Equals(context, v8_str(isolate, "f64")).To(&equal) &&
+               equal) {
+      type = i::wasm::kWasmF64;
+    } else {
+      thrower.TypeError(
+          "Descriptor property 'type' must be 'i32', 'f32', or 'f64'");
+      return;
+    }
+  }
+
+  const uint32_t offset = 0;
+  i::MaybeHandle<i::WasmGlobalObject> maybe_global_obj =
+      i::WasmGlobalObject::New(i_isolate, i::MaybeHandle<i::JSArrayBuffer>(),
+                               type, offset, is_mutable);
+
+  i::Handle<i::WasmGlobalObject> global_obj;
+  if (!maybe_global_obj.ToHandle(&global_obj)) {
+    thrower.RangeError("could not allocate memory");
+    return;
+  }
+
+  // Convert value to a WebAssembly value, the default value is 0.
+  Local<v8::Value> value = Local<Value>::Cast(args[1]);
+  switch (type) {
+    case i::wasm::kWasmI32: {
+      int32_t i32_value = 0;
+      if (!value->IsUndefined()) {
+        v8::Local<v8::Int32> int32_value;
+        if (!value->ToInt32(context).ToLocal(&int32_value)) return;
+        if (!int32_value->Int32Value(context).To(&i32_value)) return;
+      }
+      global_obj->SetI32(i32_value);
+      break;
+    }
+    case i::wasm::kWasmF32: {
+      float f32_value = 0;
+      if (!value->IsUndefined()) {
+        double f64_value = 0;
+        v8::Local<v8::Number> number_value;
+        if (!value->ToNumber(context).ToLocal(&number_value)) return;
+        if (!number_value->NumberValue(context).To(&f64_value)) return;
+        f32_value = static_cast<float>(f64_value);
+      }
+      global_obj->SetF32(f32_value);
+      break;
+    }
+    case i::wasm::kWasmF64: {
+      double f64_value = 0;
+      if (!value->IsUndefined()) {
+        v8::Local<v8::Number> number_value;
+        if (!value->ToNumber(context).ToLocal(&number_value)) return;
+        if (!number_value->NumberValue(context).To(&f64_value)) return;
+      }
+      global_obj->SetF64(f64_value);
+      break;
+    }
+    default:
+      UNREACHABLE();
+  }
+
+  i::Handle<i::JSObject> global_js_object(global_obj);
+  args.GetReturnValue().Set(Utils::ToLocal(global_js_object));
+}
+
+constexpr const char* kName_WasmGlobalObject = "WebAssembly.Global";
 constexpr const char* kName_WasmMemoryObject = "WebAssembly.Memory";
 constexpr const char* kName_WasmInstanceObject = "WebAssembly.Instance";
 constexpr const char* kName_WasmTableObject = "WebAssembly.Table";
@@ -790,11 +1084,8 @@ void WebAssemblyTableSet(const v8::FunctionCallbackInfo<v8::Value>& args) {
 
   // Parameter 1.
   i::Handle<i::Object> value = Utils::OpenHandle(*args[1]);
-  // TODO(titzer): use WasmExportedFunction::IsWasmExportedFunction() here.
   if (!value->IsNull(i_isolate) &&
-      (!value->IsJSFunction() ||
-       i::Handle<i::JSFunction>::cast(value)->code()->kind() !=
-           i::Code::JS_TO_WASM_FUNCTION)) {
+      !i::WasmExportedFunction::IsWasmExportedFunction(*value)) {
     thrower.TypeError("Argument 1 must be null or a WebAssembly function");
     return;
   }
@@ -804,20 +1095,7 @@ void WebAssemblyTableSet(const v8::FunctionCallbackInfo<v8::Value>& args) {
     return;
   }
 
-  // TODO(v8:7232) Allow reset/mutation after addressing referenced issue.
-  int32_t int_index = static_cast<int32_t>(index);
-  if (receiver->functions()->get(int_index) !=
-          i_isolate->heap()->undefined_value() &&
-      receiver->functions()->get(int_index) !=
-          i_isolate->heap()->null_value()) {
-    for (i::StackFrameIterator it(i_isolate); !it.done(); it.Advance()) {
-      if (it.frame()->type() == i::StackFrame::WASM_TO_JS) {
-        thrower.RangeError("Modifying existing entry in table not supported.");
-        return;
-      }
-    }
-  }
-  i::WasmTableObject::Set(i_isolate, receiver, static_cast<int32_t>(int_index),
+  i::WasmTableObject::Set(i_isolate, receiver, static_cast<int32_t>(index),
                           value->IsNull(i_isolate)
                               ? i::Handle<i::JSFunction>::null()
                               : i::Handle<i::JSFunction>::cast(value));
@@ -889,6 +1167,88 @@ void WebAssemblyMemoryGetBuffer(
   v8::ReturnValue<v8::Value> return_value = args.GetReturnValue();
   return_value.Set(Utils::ToLocal(buffer));
 }
+
+void WebAssemblyGlobalGetValueCommon(
+    const v8::FunctionCallbackInfo<v8::Value>& args, const char* name) {
+  v8::Isolate* isolate = args.GetIsolate();
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+  HandleScope scope(isolate);
+  ScheduledErrorThrower thrower(i_isolate, name);
+  EXTRACT_THIS(receiver, WasmGlobalObject);
+
+  v8::ReturnValue<v8::Value> return_value = args.GetReturnValue();
+
+  switch (receiver->type()) {
+    case i::wasm::kWasmI32:
+      return_value.Set(receiver->GetI32());
+      break;
+    case i::wasm::kWasmI64:
+      thrower.TypeError("Can't get the value of i64 WebAssembly.Global");
+      break;
+    case i::wasm::kWasmF32:
+      return_value.Set(receiver->GetF32());
+      break;
+    case i::wasm::kWasmF64:
+      return_value.Set(receiver->GetF64());
+      break;
+    default:
+      UNREACHABLE();
+  }
+}
+
+// WebAssembly.Global.valueOf() -> num
+void WebAssemblyGlobalValueOf(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  return WebAssemblyGlobalGetValueCommon(args, "WebAssembly.Global.valueOf()");
+}
+
+// get WebAssembly.Global.value -> num
+void WebAssemblyGlobalGetValue(
+    const v8::FunctionCallbackInfo<v8::Value>& args) {
+  return WebAssemblyGlobalGetValueCommon(args, "get WebAssembly.Global.value");
+}
+
+// set WebAssembly.Global.value(num)
+void WebAssemblyGlobalSetValue(
+    const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+  HandleScope scope(isolate);
+  Local<Context> context = isolate->GetCurrentContext();
+  ScheduledErrorThrower thrower(i_isolate, "set WebAssembly.Global.value");
+  EXTRACT_THIS(receiver, WasmGlobalObject);
+
+  if (!receiver->is_mutable()) {
+    thrower.TypeError("Can't set the value of an immutable global.");
+    return;
+  }
+
+  switch (receiver->type()) {
+    case i::wasm::kWasmI32: {
+      int32_t i32_value = 0;
+      if (!args[0]->Int32Value(context).To(&i32_value)) return;
+      receiver->SetI32(i32_value);
+      break;
+    }
+    case i::wasm::kWasmI64:
+      thrower.TypeError("Can't set the value of i64 WebAssembly.Global");
+      break;
+    case i::wasm::kWasmF32: {
+      double f64_value = 0;
+      if (!args[0]->NumberValue(context).To(&f64_value)) return;
+      receiver->SetF32(static_cast<float>(f64_value));
+      break;
+    }
+    case i::wasm::kWasmF64: {
+      double f64_value = 0;
+      if (!args[0]->NumberValue(context).To(&f64_value)) return;
+      receiver->SetF64(f64_value);
+      break;
+    }
+    default:
+      UNREACHABLE();
+  }
+}
+
 }  // namespace
 
 // TODO(titzer): we use the API to create the function template because the
@@ -903,33 +1263,65 @@ static i::Handle<i::FunctionTemplateInfo> NewTemplate(i::Isolate* i_isolate,
 
 namespace internal {
 
+Handle<JSFunction> CreateFunc(Isolate* isolate, Handle<String> name,
+                              FunctionCallback func) {
+  Handle<FunctionTemplateInfo> temp = NewTemplate(isolate, func);
+  Handle<JSFunction> function =
+      ApiNatives::InstantiateFunction(temp, name).ToHandleChecked();
+  DCHECK(function->shared()->HasSharedName());
+  return function;
+}
+
 Handle<JSFunction> InstallFunc(Isolate* isolate, Handle<JSObject> object,
                                const char* str, FunctionCallback func,
                                int length = 0) {
   Handle<String> name = v8_str(isolate, str);
-  Handle<FunctionTemplateInfo> temp = NewTemplate(isolate, func);
-  Handle<JSFunction> function =
-      ApiNatives::InstantiateFunction(temp, name).ToHandleChecked();
-  DCHECK(function->shared()->has_shared_name());
+  Handle<JSFunction> function = CreateFunc(isolate, name, func);
   function->shared()->set_length(length);
   PropertyAttributes attributes = static_cast<PropertyAttributes>(DONT_ENUM);
   JSObject::AddProperty(object, name, function, attributes);
   return function;
 }
 
+Handle<String> GetterName(Isolate* isolate, Handle<String> name) {
+  return Name::ToFunctionName(name, isolate->factory()->get_string())
+      .ToHandleChecked();
+}
+
 void InstallGetter(Isolate* isolate, Handle<JSObject> object,
                    const char* str, FunctionCallback func) {
   Handle<String> name = v8_str(isolate, str);
-  Handle<FunctionTemplateInfo> temp = NewTemplate(isolate, func);
-  // TODO(ishell): shouldn't we set "get "+name as getter's name?
   Handle<JSFunction> function =
-      ApiNatives::InstantiateFunction(temp).ToHandleChecked();
-  DCHECK(function->shared()->has_shared_name());
+      CreateFunc(isolate, GetterName(isolate, name), func);
+
   v8::PropertyAttribute attributes =
       static_cast<v8::PropertyAttribute>(v8::DontEnum);
   Utils::ToLocal(object)->SetAccessorProperty(Utils::ToLocal(name),
                                               Utils::ToLocal(function),
                                               Local<Function>(), attributes);
+}
+
+Handle<String> SetterName(Isolate* isolate, Handle<String> name) {
+  return Name::ToFunctionName(name, isolate->factory()->set_string())
+      .ToHandleChecked();
+}
+
+void InstallGetterSetter(Isolate* isolate, Handle<JSObject> object,
+                         const char* str, FunctionCallback getter,
+                         FunctionCallback setter) {
+  Handle<String> name = v8_str(isolate, str);
+  Handle<JSFunction> getter_func =
+      CreateFunc(isolate, GetterName(isolate, name), getter);
+  Handle<JSFunction> setter_func =
+      CreateFunc(isolate, SetterName(isolate, name), setter);
+  setter_func->shared()->set_length(1);
+
+  v8::PropertyAttribute attributes =
+      static_cast<v8::PropertyAttribute>(v8::DontEnum);
+
+  Utils::ToLocal(object)->SetAccessorProperty(
+      Utils::ToLocal(name), Utils::ToLocal(getter_func),
+      Utils::ToLocal(setter_func), attributes);
 }
 
 void WasmJs::Install(Isolate* isolate, bool exposed_on_global_object) {
@@ -980,9 +1372,8 @@ void WasmJs::Install(Isolate* isolate, bool exposed_on_global_object) {
   JSFunction::EnsureHasInitialMap(module_constructor);
   Handle<JSObject> module_proto(
       JSObject::cast(module_constructor->instance_prototype()));
-  i::Handle<i::Map> module_map = isolate->factory()->NewMap(
-      i::WASM_MODULE_TYPE, i::JSObject::kHeaderSize +
-                               WasmModuleObject::kFieldCount * i::kPointerSize);
+  i::Handle<i::Map> module_map =
+      isolate->factory()->NewMap(i::WASM_MODULE_TYPE, WasmModuleObject::kSize);
   JSFunction::SetInitialMap(module_constructor, module_map, module_proto);
   InstallFunc(isolate, module_constructor, "imports", WebAssemblyModuleImports,
               1);
@@ -1039,6 +1430,24 @@ void WasmJs::Install(Isolate* isolate, bool exposed_on_global_object) {
   InstallGetter(isolate, memory_proto, "buffer", WebAssemblyMemoryGetBuffer);
   JSObject::AddProperty(memory_proto, factory->to_string_tag_symbol(),
                         v8_str(isolate, "WebAssembly.Memory"), ro_attributes);
+
+  // Setup Global
+  if (i::FLAG_experimental_wasm_mut_global) {
+    Handle<JSFunction> global_constructor =
+        InstallFunc(isolate, webassembly, "Global", WebAssemblyGlobal, 1);
+    context->set_wasm_global_constructor(*global_constructor);
+    JSFunction::EnsureHasInitialMap(global_constructor);
+    Handle<JSObject> global_proto(
+        JSObject::cast(global_constructor->instance_prototype()));
+    i::Handle<i::Map> global_map = isolate->factory()->NewMap(
+        i::WASM_GLOBAL_TYPE, WasmGlobalObject::kSize);
+    JSFunction::SetInitialMap(global_constructor, global_map, global_proto);
+    InstallFunc(isolate, global_proto, "valueOf", WebAssemblyGlobalValueOf, 0);
+    InstallGetterSetter(isolate, global_proto, "value",
+                        WebAssemblyGlobalGetValue, WebAssemblyGlobalSetValue);
+    JSObject::AddProperty(global_proto, factory->to_string_tag_symbol(),
+                          v8_str(isolate, "WebAssembly.Global"), ro_attributes);
+  }
 
   // Setup errors
   attributes = static_cast<PropertyAttributes>(DONT_ENUM);

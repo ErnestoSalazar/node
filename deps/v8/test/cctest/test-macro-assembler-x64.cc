@@ -30,9 +30,10 @@
 #include "src/v8.h"
 
 #include "src/base/platform/platform.h"
-#include "src/factory.h"
+#include "src/heap/factory.h"
 #include "src/macro-assembler.h"
 #include "src/objects-inl.h"
+#include "src/simulator.h"
 #include "test/cctest/cctest.h"
 
 namespace v8 {
@@ -48,7 +49,7 @@ namespace test_macro_assembler_x64 {
 // This calling convention is used on Linux, with GCC, and on Mac OS,
 // with GCC.  A different convention is used on 64-bit windows.
 
-typedef int (*F0)();
+typedef int(F0)();
 
 #define __ masm->
 
@@ -129,7 +130,8 @@ TEST(SmiMove) {
   masm->GetCode(isolate, &desc);
   MakeAssemblerBufferExecutable(buffer, allocated);
   // Call the function from C++.
-  int result = FUNCTION_CAST<F0>(buffer)();
+  auto f = GeneratedCode<F0>::FromBuffer(CcTest::i_isolate(), buffer);
+  int result = f.Call();
   CHECK_EQ(0, result);
 }
 
@@ -221,13 +223,12 @@ TEST(SmiCompare) {
   masm->GetCode(isolate, &desc);
   MakeAssemblerBufferExecutable(buffer, allocated);
   // Call the function from C++.
-  int result = FUNCTION_CAST<F0>(buffer)();
+  auto f = GeneratedCode<F0>::FromBuffer(CcTest::i_isolate(), buffer);
+  int result = f.Call();
   CHECK_EQ(0, result);
 }
 
-
-
-TEST(Integer32ToSmi) {
+TEST(SmiTag) {
   Isolate* isolate = CcTest::i_isolate();
   HandleScope handles(isolate);
   size_t allocated;
@@ -240,36 +241,36 @@ TEST(Integer32ToSmi) {
   Label exit;
 
   __ movq(rax, Immediate(1));  // Test number.
-  __ movl(rcx, Immediate(0));
-  __ Integer32ToSmi(rcx, rcx);
+  __ movq(rcx, Immediate(0));
+  __ SmiTag(rcx, rcx);
   __ Set(rdx, reinterpret_cast<intptr_t>(Smi::kZero));
   __ cmpq(rcx, rdx);
   __ j(not_equal, &exit);
 
   __ movq(rax, Immediate(2));  // Test number.
-  __ movl(rcx, Immediate(1024));
-  __ Integer32ToSmi(rcx, rcx);
+  __ movq(rcx, Immediate(1024));
+  __ SmiTag(rcx, rcx);
   __ Set(rdx, reinterpret_cast<intptr_t>(Smi::FromInt(1024)));
   __ cmpq(rcx, rdx);
   __ j(not_equal, &exit);
 
   __ movq(rax, Immediate(3));  // Test number.
-  __ movl(rcx, Immediate(-1));
-  __ Integer32ToSmi(rcx, rcx);
+  __ movq(rcx, Immediate(-1));
+  __ SmiTag(rcx, rcx);
   __ Set(rdx, reinterpret_cast<intptr_t>(Smi::FromInt(-1)));
   __ cmpq(rcx, rdx);
   __ j(not_equal, &exit);
 
   __ movq(rax, Immediate(4));  // Test number.
-  __ movl(rcx, Immediate(Smi::kMaxValue));
-  __ Integer32ToSmi(rcx, rcx);
+  __ movq(rcx, Immediate(Smi::kMaxValue));
+  __ SmiTag(rcx, rcx);
   __ Set(rdx, reinterpret_cast<intptr_t>(Smi::FromInt(Smi::kMaxValue)));
   __ cmpq(rcx, rdx);
   __ j(not_equal, &exit);
 
   __ movq(rax, Immediate(5));  // Test number.
-  __ movl(rcx, Immediate(Smi::kMinValue));
-  __ Integer32ToSmi(rcx, rcx);
+  __ movq(rcx, Immediate(Smi::kMinValue));
+  __ SmiTag(rcx, rcx);
   __ Set(rdx, reinterpret_cast<intptr_t>(Smi::FromInt(Smi::kMinValue)));
   __ cmpq(rcx, rdx);
   __ j(not_equal, &exit);
@@ -277,36 +278,36 @@ TEST(Integer32ToSmi) {
   // Different target register.
 
   __ movq(rax, Immediate(6));  // Test number.
-  __ movl(rcx, Immediate(0));
-  __ Integer32ToSmi(r8, rcx);
+  __ movq(rcx, Immediate(0));
+  __ SmiTag(r8, rcx);
   __ Set(rdx, reinterpret_cast<intptr_t>(Smi::kZero));
   __ cmpq(r8, rdx);
   __ j(not_equal, &exit);
 
   __ movq(rax, Immediate(7));  // Test number.
-  __ movl(rcx, Immediate(1024));
-  __ Integer32ToSmi(r8, rcx);
+  __ movq(rcx, Immediate(1024));
+  __ SmiTag(r8, rcx);
   __ Set(rdx, reinterpret_cast<intptr_t>(Smi::FromInt(1024)));
   __ cmpq(r8, rdx);
   __ j(not_equal, &exit);
 
   __ movq(rax, Immediate(8));  // Test number.
-  __ movl(rcx, Immediate(-1));
-  __ Integer32ToSmi(r8, rcx);
+  __ movq(rcx, Immediate(-1));
+  __ SmiTag(r8, rcx);
   __ Set(rdx, reinterpret_cast<intptr_t>(Smi::FromInt(-1)));
   __ cmpq(r8, rdx);
   __ j(not_equal, &exit);
 
   __ movq(rax, Immediate(9));  // Test number.
-  __ movl(rcx, Immediate(Smi::kMaxValue));
-  __ Integer32ToSmi(r8, rcx);
+  __ movq(rcx, Immediate(Smi::kMaxValue));
+  __ SmiTag(r8, rcx);
   __ Set(rdx, reinterpret_cast<intptr_t>(Smi::FromInt(Smi::kMaxValue)));
   __ cmpq(r8, rdx);
   __ j(not_equal, &exit);
 
   __ movq(rax, Immediate(10));  // Test number.
-  __ movl(rcx, Immediate(Smi::kMinValue));
-  __ Integer32ToSmi(r8, rcx);
+  __ movq(rcx, Immediate(Smi::kMinValue));
+  __ SmiTag(r8, rcx);
   __ Set(rdx, reinterpret_cast<intptr_t>(Smi::FromInt(Smi::kMinValue)));
   __ cmpq(r8, rdx);
   __ j(not_equal, &exit);
@@ -321,7 +322,8 @@ TEST(Integer32ToSmi) {
   masm->GetCode(isolate, &desc);
   MakeAssemblerBufferExecutable(buffer, allocated);
   // Call the function from C++.
-  int result = FUNCTION_CAST<F0>(buffer)();
+  auto f = GeneratedCode<F0>::FromBuffer(CcTest::i_isolate(), buffer);
+  int result = f.Call();
   CHECK_EQ(0, result);
 }
 
@@ -343,7 +345,7 @@ TEST(SmiCheck) {
   // CheckSmi
 
   __ movl(rcx, Immediate(0));
-  __ Integer32ToSmi(rcx, rcx);
+  __ SmiTag(rcx, rcx);
   cond = masm->CheckSmi(rcx);
   __ j(NegateCondition(cond), &exit);
 
@@ -354,7 +356,7 @@ TEST(SmiCheck) {
 
   __ incq(rax);
   __ movl(rcx, Immediate(-1));
-  __ Integer32ToSmi(rcx, rcx);
+  __ SmiTag(rcx, rcx);
   cond = masm->CheckSmi(rcx);
   __ j(NegateCondition(cond), &exit);
 
@@ -365,7 +367,7 @@ TEST(SmiCheck) {
 
   __ incq(rax);
   __ movl(rcx, Immediate(Smi::kMaxValue));
-  __ Integer32ToSmi(rcx, rcx);
+  __ SmiTag(rcx, rcx);
   cond = masm->CheckSmi(rcx);
   __ j(NegateCondition(cond), &exit);
 
@@ -376,7 +378,7 @@ TEST(SmiCheck) {
 
   __ incq(rax);
   __ movl(rcx, Immediate(Smi::kMinValue));
-  __ Integer32ToSmi(rcx, rcx);
+  __ SmiTag(rcx, rcx);
   cond = masm->CheckSmi(rcx);
   __ j(NegateCondition(cond), &exit);
 
@@ -396,7 +398,8 @@ TEST(SmiCheck) {
   masm->GetCode(isolate, &desc);
   MakeAssemblerBufferExecutable(buffer, allocated);
   // Call the function from C++.
-  int result = FUNCTION_CAST<F0>(buffer)();
+  auto f = GeneratedCode<F0>::FromBuffer(CcTest::i_isolate(), buffer);
+  int result = f.Call();
   CHECK_EQ(0, result);
 }
 
@@ -450,7 +453,8 @@ TEST(SmiIndex) {
   masm->GetCode(isolate, &desc);
   MakeAssemblerBufferExecutable(buffer, allocated);
   // Call the function from C++.
-  int result = FUNCTION_CAST<F0>(buffer)();
+  auto f = GeneratedCode<F0>::FromBuffer(CcTest::i_isolate(), buffer);
+  int result = f.Call();
   CHECK_EQ(0, result);
 }
 
@@ -801,7 +805,8 @@ TEST(OperandOffset) {
   masm->GetCode(isolate, &desc);
   MakeAssemblerBufferExecutable(buffer, allocated);
   // Call the function from C++.
-  int result = FUNCTION_CAST<F0>(buffer)();
+  auto f = GeneratedCode<F0>::FromBuffer(CcTest::i_isolate(), buffer);
+  int result = f.Call();
   CHECK_EQ(0, result);
 }
 
@@ -948,7 +953,8 @@ TEST(LoadAndStoreWithRepresentation) {
   masm->GetCode(isolate, &desc);
   MakeAssemblerBufferExecutable(buffer, allocated);
   // Call the function from C++.
-  int result = FUNCTION_CAST<F0>(buffer)();
+  auto f = GeneratedCode<F0>::FromBuffer(CcTest::i_isolate(), buffer);
+  int result = f.Call();
   CHECK_EQ(0, result);
 }
 
@@ -1101,7 +1107,8 @@ TEST(SIMDMacros) {
   masm->GetCode(isolate, &desc);
   MakeAssemblerBufferExecutable(buffer, allocated);
   // Call the function from C++.
-  int result = FUNCTION_CAST<F0>(buffer)();
+  auto f = GeneratedCode<F0>::FromBuffer(CcTest::i_isolate(), buffer);
+  int result = f.Call();
   CHECK_EQ(0, result);
 }
 

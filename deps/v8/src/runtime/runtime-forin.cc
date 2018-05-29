@@ -6,10 +6,11 @@
 
 #include "src/arguments.h"
 #include "src/elements.h"
-#include "src/factory.h"
+#include "src/heap/factory.h"
 #include "src/isolate-inl.h"
 #include "src/keys.h"
 #include "src/objects-inl.h"
+#include "src/objects/module.h"
 
 namespace v8 {
 namespace internal {
@@ -36,11 +37,12 @@ MaybeHandle<HeapObject> Enumerate(Handle<JSReceiver> receiver) {
     // Test again, since cache may have been built by GetKeys() calls above.
     if (!accumulator.is_receiver_simple_enum()) return keys;
   }
+  DCHECK(!receiver->IsJSModuleNamespace());
   return handle(receiver->map(), isolate);
 }
 
 // This is a slight modifcation of JSReceiver::HasProperty, dealing with
-// the oddities of JSProxy in for-in filter.
+// the oddities of JSProxy and JSModuleNamespace in for-in filter.
 MaybeHandle<Object> HasEnumerableProperty(Isolate* isolate,
                                           Handle<JSReceiver> receiver,
                                           Handle<Object> key) {
@@ -92,7 +94,14 @@ MaybeHandle<Object> HasEnumerableProperty(Isolate* isolate,
       case LookupIterator::INTEGER_INDEXED_EXOTIC:
         // TypedArray out-of-bounds access.
         return isolate->factory()->undefined_value();
-      case LookupIterator::ACCESSOR:
+      case LookupIterator::ACCESSOR: {
+        if (it.GetHolder<Object>()->IsJSModuleNamespace()) {
+          result = JSModuleNamespace::GetPropertyAttributes(&it);
+          if (result.IsNothing()) return MaybeHandle<Object>();
+          DCHECK_EQ(0, result.FromJust() & DONT_ENUM);
+        }
+        return it.GetName();
+      }
       case LookupIterator::DATA:
         return it.GetName();
     }

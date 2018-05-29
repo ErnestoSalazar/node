@@ -4,6 +4,7 @@
 
 #include "src/builtins/builtins-arguments-gen.h"
 
+#include "src/arguments.h"
 #include "src/builtins/builtins-utils-gen.h"
 #include "src/builtins/builtins.h"
 #include "src/code-factory.h"
@@ -11,6 +12,7 @@
 #include "src/frame-constants.h"
 #include "src/interface-descriptors.h"
 #include "src/objects-inl.h"
+#include "src/objects/arguments.h"
 
 namespace v8 {
 namespace internal {

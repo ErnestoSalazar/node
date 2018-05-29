@@ -10,17 +10,16 @@
 
 #include "include/libplatform/libplatform.h"
 #include "include/v8.h"
-
 #include "src/api.h"
 #include "src/base/logging.h"
-#include "src/objects-inl.h"
-#include "src/runtime/runtime.h"
-
 #include "src/interpreter/bytecode-array-iterator.h"
 #include "src/interpreter/bytecode-generator.h"
 #include "src/interpreter/bytecodes.h"
 #include "src/interpreter/interpreter-intrinsics.h"
 #include "src/interpreter/interpreter.h"
+#include "src/objects-inl.h"
+#include "src/objects/module-inl.h"
+#include "src/runtime/runtime.h"
 #include "src/source-position-table.h"
 
 namespace v8 {
@@ -81,7 +80,8 @@ v8::Local<v8::Module> BytecodeExpectationsPrinter::CompileModule(
 }
 
 void BytecodeExpectationsPrinter::Run(v8::Local<v8::Script> script) const {
-  (void)script->Run(isolate_->GetCurrentContext());
+  MaybeLocal<Value> result = script->Run(isolate_->GetCurrentContext());
+  USE(result);
 }
 
 i::Handle<v8::internal::BytecodeArray>
@@ -95,7 +95,7 @@ BytecodeExpectationsPrinter::GetBytecodeArrayForGlobal(
       i::Handle<i::JSFunction>::cast(v8::Utils::OpenHandle(*function));
 
   i::Handle<i::BytecodeArray> bytecodes =
-      i::handle(js_function->shared()->bytecode_array(), i_isolate());
+      i::handle(js_function->shared()->GetBytecodeArray(), i_isolate());
 
   return bytecodes;
 }
@@ -104,15 +104,16 @@ i::Handle<i::BytecodeArray>
 BytecodeExpectationsPrinter::GetBytecodeArrayForModule(
     v8::Local<v8::Module> module) const {
   i::Handle<i::Module> i_module = v8::Utils::OpenHandle(*module);
-  return i::handle(SharedFunctionInfo::cast(i_module->code())->bytecode_array(),
-                   i_isolate());
+  return i::handle(
+      SharedFunctionInfo::cast(i_module->code())->GetBytecodeArray(),
+      i_isolate());
 }
 
 i::Handle<i::BytecodeArray>
 BytecodeExpectationsPrinter::GetBytecodeArrayForScript(
     v8::Local<v8::Script> script) const {
   i::Handle<i::JSFunction> js_function = v8::Utils::OpenHandle(*script);
-  return i::handle(js_function->shared()->bytecode_array(), i_isolate());
+  return i::handle(js_function->shared()->GetBytecodeArray(), i_isolate());
 }
 
 void BytecodeExpectationsPrinter::PrintEscapedString(

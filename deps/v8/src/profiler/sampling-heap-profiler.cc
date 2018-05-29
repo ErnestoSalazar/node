@@ -203,13 +203,13 @@ SamplingHeapProfiler::AllocationNode* SamplingHeapProfiler::AddStack() {
   // the first element in the list.
   for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
     SharedFunctionInfo* shared = *it;
-    const char* name = this->names()->GetFunctionName(shared->DebugName());
+    const char* name = this->names()->GetName(shared->DebugName());
     int script_id = v8::UnboundScript::kNoScriptId;
     if (shared->script()->IsScript()) {
       Script* script = Script::cast(shared->script());
       script_id = script->id();
     }
-    node = node->FindOrAddChildNode(name, script_id, shared->start_position());
+    node = node->FindOrAddChildNode(name, script_id, shared->StartPosition());
   }
 
   if (found_arguments_marker_frames) {

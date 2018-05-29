@@ -211,6 +211,23 @@ Assignment::Assignment(NodeType node_type, Token::Value op, Expression* target,
   bit_field_ |= TokenField::encode(op);
 }
 
+void FunctionLiteral::set_inferred_name(Handle<String> inferred_name) {
+  DCHECK(!inferred_name.is_null());
+  inferred_name_ = inferred_name;
+  DCHECK(raw_inferred_name_ == nullptr || raw_inferred_name_->IsEmpty());
+  raw_inferred_name_ = nullptr;
+  scope()->set_has_inferred_function_name(true);
+}
+
+void FunctionLiteral::set_raw_inferred_name(
+    const AstConsString* raw_inferred_name) {
+  DCHECK_NOT_NULL(raw_inferred_name);
+  raw_inferred_name_ = raw_inferred_name;
+  DCHECK(inferred_name_.is_null());
+  inferred_name_ = Handle<String>();
+  scope()->set_has_inferred_function_name(true);
+}
+
 bool FunctionLiteral::ShouldEagerCompile() const {
   return scope()->ShouldEagerCompile();
 }
@@ -259,7 +276,9 @@ std::unique_ptr<char[]> FunctionLiteral::GetDebugName() const {
     AllowHandleDereference allow_deref;
     return inferred_name_->ToCString();
   } else {
-    return std::unique_ptr<char[]>(new char{'\0'});
+    char* empty_str = new char[1];
+    empty_str[0] = 0;
+    return std::unique_ptr<char[]>(empty_str);
   }
 
   // TODO(rmcilroy): Deal with two-character strings.
@@ -341,19 +360,37 @@ void ObjectLiteral::CalculateEmitStore(Zone* zone) {
     Literal* literal = property->key()->AsLiteral();
     DCHECK(!literal->IsNullLiteral());
 
-    // If there is an existing entry do not emit a store unless the previous
-    // entry was also an accessor.
     uint32_t hash = literal->Hash();
     ZoneHashMap::Entry* entry = table.LookupOrInsert(literal, hash, allocator);
-    if (entry->value != nullptr) {
-      auto previous_kind =
+    if (entry->value == nullptr) {
+      entry->value = property;
+    } else {
+      // We already have a later definition of this property, so we don't need
+      // to emit a store for the current one.
+      //
+      // There are two subtleties here.
+      //
+      // (1) Emitting a store might actually be incorrect. For example, in {get
+      // foo() {}, foo: 42}, the getter store would override the data property
+      // (which, being a non-computed compile-time valued property, is already
+      // part of the initial literal object.
+      //
+      // (2) If the later definition is an accessor (say, a getter), and the
+      // current definition is a complementary accessor (here, a setter), then
+      // we still must emit a store for the current definition.
+
+      auto later_kind =
           static_cast<ObjectLiteral::Property*>(entry->value)->kind();
-      if (!((property->kind() == GETTER && previous_kind == SETTER) ||
-            (property->kind() == SETTER && previous_kind == GETTER))) {
+      bool complementary_accessors =
+          (property->kind() == GETTER && later_kind == SETTER) ||
+          (property->kind() == SETTER && later_kind == GETTER);
+      if (!complementary_accessors) {
         property->set_emit_store(false);
+        if (later_kind == GETTER || later_kind == SETTER) {
+          entry->value = property;
+        }
       }
     }
-    entry->value = property;
   }
 }
 
